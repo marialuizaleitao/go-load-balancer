@@ -5,39 +5,37 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
+	"sync"
 )
 
 type Server interface {
 	Address() string
-	isAlive() bool
+	IsAlive() bool
 	Serve(rw http.ResponseWriter, r *http.Request)
 }
 
-type simpleServer struct {
+type SimpleServer struct {
 	address string
 	proxy   *httputil.ReverseProxy
+}
+
+func (s *SimpleServer) Address() string {
+	return s.address
+}
+
+func (s *SimpleServer) IsAlive() bool {
+	return true
+}
+
+func (s *SimpleServer) Serve(rw http.ResponseWriter, r *http.Request) {
+	s.proxy.ServeHTTP(rw, r)
 }
 
 type LoadBalancer struct {
 	port            string
 	roundRobinCount int
 	servers         []Server
-}
-
-func (s *simpleServer) Address() string { return s.address }
-
-func (s *simpleServer) isAlive() bool { return true }
-
-func (s *simpleServer) Serve(rw http.ResponseWriter, r *http.Request) {
-	s.proxy.ServeHTTP(rw, r)
-}
-
-func handleError(err error) {
-	if err != nil {
-		fmt.Printf("Error: %s\n", err.Error())
-		os.Exit(1)
-	}
+	mu              sync.Mutex
 }
 
 func NewLoadBalancer(port string, servers []Server) *LoadBalancer {
@@ -48,39 +46,53 @@ func NewLoadBalancer(port string, servers []Server) *LoadBalancer {
 	}
 }
 
-func newSimpleServer(address string) *simpleServer {
-	serverUrl, err := url.Parse(address)
+func NewSimpleServer(address string) *SimpleServer {
+	serverURL, err := url.Parse(address)
 	if err != nil {
-		handleError(err)
+		panic(fmt.Sprintf("Error parsing server URL %s: %v", address, err))
 	}
 
-	return &simpleServer{
+	return &SimpleServer{
 		address: address,
-		proxy:   httputil.NewSingleHostReverseProxy(serverUrl),
+		proxy:   httputil.NewSingleHostReverseProxy(serverURL),
 	}
 }
 
 func (lb *LoadBalancer) getNextAvailableServer() Server {
-	server := lb.servers[lb.roundRobinCount%len(lb.servers)]
-	for !server.isAlive() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	for i := 0; i < len(lb.servers); i++ {
+		server := lb.servers[lb.roundRobinCount%len(lb.servers)]
 		lb.roundRobinCount++
-		server = lb.servers[lb.roundRobinCount%len(lb.servers)]
+		if server.IsAlive() {
+			return server
+		}
 	}
-	lb.roundRobinCount++
-	return server
+
+	if len(lb.servers) > 0 {
+		return lb.servers[0]
+	}
+
+	return nil
 }
 
 func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, r *http.Request) {
 	targetServer := lb.getNextAvailableServer()
-	fmt.Printf("Forwarding request to adddress %s\n", targetServer.Address())
+	if targetServer == nil {
+		http.Error(rw, "No available servers", http.StatusServiceUnavailable)
+		return
+	}
+
+	fmt.Printf("Forwarding request to address %s\n", targetServer.Address())
 	targetServer.Serve(rw, r)
 }
 
 func main() {
 	servers := []Server{
-		newSimpleServer("https://www.facebook.com"),
-		newSimpleServer("http://www.bing.com"),
-		newSimpleServer("https://www.google.com"),
+		NewSimpleServer("https://www.facebook.com"),
+		NewSimpleServer("http://www.bing.com"),
+		NewSimpleServer("https://www.google.com"),
 	}
 	lb := NewLoadBalancer("8000", servers)
 	handleRedirect := func(rw http.ResponseWriter, r *http.Request) {
